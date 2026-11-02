@@ -7,7 +7,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 APP_NAME="Cloudflare Tunnel Manager"
-APP_VERSION="4.0"
+APP_VERSION="4.1"
 CF_KEY_URL="https://pkg.cloudflare.com/cloudflare-main.gpg"
 CF_REPO_URL="https://pkg.cloudflare.com/cloudflared"
 CF_KEYRING="/usr/share/keyrings/cloudflare-main.gpg"
@@ -19,6 +19,7 @@ SERVICE_NAME="cloudflared-custom.service"
 SERVICE_FILE="/etc/systemd/system/$SERVICE_NAME"
 STATE_FILE="$CONFIG_DIR/manager.conf"
 BACKUP_DIR="/var/backups/cloudflared-manager"
+ROOT_CF_DIR="/root/.cloudflared"
 
 # ---------- Terminal styling ----------
 if [[ -t 1 ]]; then
@@ -183,7 +184,7 @@ EOF
 # ---------- Create tunnel ----------
 create_tunnel(){
   ensure_cloudflared || return 1
-  install -d -m 0700 /root/.cloudflared "$CONFIG_DIR"
+  install -d -m 0700 "$ROOT_CF_DIR" "$CONFIG_DIR"
 
   printf '\n%s%s  浏览器授权  %s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
   echo "接下来会运行 cloudflared tunnel login。"
@@ -195,11 +196,11 @@ create_tunnel(){
     err "Cloudflare 浏览器授权失败或未完成。"
     return 1
   fi
-  [[ -s /root/.cloudflared/cert.pem ]] || {
-    err "没有找到 /root/.cloudflared/cert.pem；请确认授权是在当前服务器的 root 会话中完成。"
+  [[ -s "$ROOT_CF_DIR/cert.pem" ]] || {
+    err "没有找到 $ROOT_CF_DIR/cert.pem；请确认授权是在当前服务器的 root 会话中完成。"
     return 1
   }
-  chmod 0600 /root/.cloudflared/cert.pem
+  chmod 0600 "$ROOT_CF_DIR/cert.pem"
 
   local name hostname origin create_output
   read -r -p "Tunnel 名称（例如 my-home）: " name
@@ -233,11 +234,11 @@ create_tunnel(){
     return 1
   }
 
-  [[ -s "/root/.cloudflared/$TUNNEL_ID.json" ]] || {
-    err "未找到 Tunnel 凭据文件：/root/.cloudflared/$TUNNEL_ID.json"
+  [[ -s "$ROOT_CF_DIR/$TUNNEL_ID.json" ]] || {
+    err "未找到 Tunnel 凭据文件：$ROOT_CF_DIR/$TUNNEL_ID.json"
     return 1
   }
-  install -m 0600 "/root/.cloudflared/$TUNNEL_ID.json" "$CONFIG_DIR/$TUNNEL_ID.json"
+  install -m 0600 "$ROOT_CF_DIR/$TUNNEL_ID.json" "$CONFIG_DIR/$TUNNEL_ID.json"
 
   info "正在为 $hostname 创建 DNS 路由..."
   if ! cloudflared tunnel route dns "$TUNNEL_ID" "$hostname"; then
@@ -363,16 +364,73 @@ update_cloudflared(){
 uninstall_local(){
   warn "此操作会停止并移除本机 systemd 服务。"
   if ! confirm "确定卸载本机 Tunnel 管理配置？"; then return; fi
+
+  local tunnel_id="" tunnel_name=""
+
+  # 先读取云端 Tunnel 信息（用于后续可选的云端删除）
+  if [[ -f "$STATE_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$STATE_FILE" || true
+    tunnel_id="${TUNNEL_ID:-}"
+    tunnel_name="${TUNNEL_NAME:-}"
+  fi
+
+  # 1. 备份账号证书（若存在）
+  if [[ -f "$ROOT_CF_DIR/cert.pem" ]]; then
+    mkdir -p "$BACKUP_DIR"
+    local cert_backup="$BACKUP_DIR/cert.pem.$(date +%Y%m%d-%H%M%S)"
+    if cp -a "$ROOT_CF_DIR/cert.pem" "$cert_backup"; then
+      chmod 0600 "$cert_backup" 2>/dev/null || true
+      ok "已备份账号证书到：$cert_backup"
+    else
+      warn "备份 cert.pem 失败，继续卸载流程。"
+    fi
+  fi
+
+  # 2. 可选：删除云端 Tunnel（必须在卸载 cloudflared 之前做）
+  if [[ -n "$tunnel_id" ]] && command -v cloudflared >/dev/null 2>&1; then
+    warn "云端 Tunnel：$tunnel_name ($tunnel_id)"
+    warn "删除云端 Tunnel 不可恢复；DNS 记录仍需在 Cloudflare Dashboard 手动删除。"
+    if confirm "是否尝试删除 Cloudflare 云端的该 Tunnel？（要求当前无活动连接）"; then
+      systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+      sleep 1
+      if cloudflared tunnel delete --force "$tunnel_id"; then
+        ok "云端 Tunnel 已删除。"
+      else
+        err "云端 Tunnel 删除失败（可能有活动连接或权限问题）。"
+        warn "可稍后在 Cloudflare Dashboard 手动删除。"
+      fi
+    else
+      info "跳过云端 Tunnel 删除。"
+    fi
+  fi
+
+  # 3. 停止并移除本机服务
   systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
   rm -f "$SERVICE_FILE"
   systemctl daemon-reload
+
+  # 4. 可选删除 /etc/cloudflared
   if confirm "同时删除 /etc/cloudflared 下的配置和凭据？"; then
     rm -rf "$CONFIG_DIR"
   fi
+
+  # 5. 可选删除 /root/.cloudflared（含 cert.pem 与所有 Tunnel 凭据）
+  if [[ -d "$ROOT_CF_DIR" ]]; then
+    warn "$ROOT_CF_DIR 包含账号级证书 cert.pem，删除后需重新 cloudflared tunnel login。"
+    warn "若本机还有其他 cloudflared 服务依赖此目录，请勿删除。"
+    if confirm "同时删除 $ROOT_CF_DIR 下的账号证书和 Tunnel 凭据？"; then
+      rm -rf "$ROOT_CF_DIR"
+      ok "已删除 $ROOT_CF_DIR"
+    fi
+  fi
+
+  # 6. 可选卸载 APT 包
   if confirm "同时通过 APT 卸载 cloudflared 软件包？"; then
     apt-get remove -y cloudflared
   fi
-  warn "此操作不会删除 Cloudflare 云端 Tunnel 或 DNS 记录。"
+
+  warn "此操作不会删除 Cloudflare 云端 Tunnel 或 DNS 记录（若上一步未选择删除云端 Tunnel）。"
   ok "本机卸载步骤完成。"
 }
 
