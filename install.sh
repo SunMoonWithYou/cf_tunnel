@@ -6,6 +6,9 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
+# 捕获 Ctrl+C，避免直接退出整个脚本
+trap 'echo; warn "已中断，返回菜单..."' INT
+
 APP_NAME="Cloudflare Tunnel Manager"
 APP_VERSION="4.1"
 CF_KEY_URL="https://pkg.cloudflare.com/cloudflare-main.gpg"
@@ -321,7 +324,11 @@ show_logs(){
     return
   fi
   echo "按 Ctrl+C 返回菜单。"
-  journalctl -u "$SERVICE_NAME" -n 80 -f
+  # 用子 shell 吃掉 SIGINT，防止整个脚本退出
+  (
+    trap 'exit 0' INT
+    journalctl -u "$SERVICE_NAME" -n 80 -f
+  ) || true
 }
 
 edit_origin(){
@@ -441,7 +448,7 @@ draw_header(){
   cat <<'BANNER'
    ____  _                 __ _are
   / ___|| | ___  _   _  __/ _| | __ _ _ __ ___
- | |    | |/ _ \| | | |/ _` | |/ _` | '__/ _ \
+ | |    | |/ _ \| | | |/ ` | |/ _` | '__/ _ \
  | |___ | | (_) | |_| | (_| | | (_| | | |  __/
   \____||_|\___/ \__,_|\__,_|_|\__,_|_|  \___|
 BANNER
@@ -484,16 +491,16 @@ main_menu(){
     local choice
     read -r -p "  请输入选项 [0-10]: " choice
     case "$choice" in
-      1) create_tunnel; pause ;;
-      2) edit_origin; pause ;;
-      3) edit_hostname; pause ;;
-      4) service_action start; pause ;;
-      5) service_action stop; pause ;;
-      6) service_action restart; pause ;;
-      7) show_status; pause ;;
-      8) show_logs; pause ;;
-      9) update_cloudflared; pause ;;
-      10) uninstall_local; pause ;;
+      1) create_tunnel || true; pause ;;
+      2) edit_origin || true; pause ;;
+      3) edit_hostname || true; pause ;;
+      4) service_action start || true; pause ;;
+      5) service_action stop || true; pause ;;
+      6) service_action restart || true; pause ;;
+      7) show_status || true; pause ;;
+      8) show_logs || true; pause ;;
+      9) update_cloudflared || true; pause ;;
+      10) uninstall_local || true; pause ;;
       0) printf '\n再见！\n'; exit 0 ;;
       *) warn "无效选项"; sleep 1 ;;
     esac
